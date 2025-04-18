@@ -1,23 +1,71 @@
-import logging  # Importa la libreria per il logging
-import os       # Importa la libreria per interagire con il sistema operativo
-from datetime import datetime # Importa datetime per ottenere la data odierna (ci servirà dopo)
+import logging
+import os
+from datetime import datetime
+import requests # Importa requests per scaricare il CSV (lo useremo dopo)
+import csv      # Importa il modulo csv per leggere i dati (lo useremo dopo)
+from io import StringIO # Importa StringIO per leggere stringhe come file (lo useremo dopo)
 
-from telegram import Update  # Importa la classe Update da telegram
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters # Importa classi da telegram.ext
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # Abilita il logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-logging.getLogger("httpx").setLevel(logging.WARNING) # Riduci verbosità logger http
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- Recupero del Token del Bot ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     logger.error("FATALE: La variabile d'ambiente TELEGRAM_BOT_TOKEN non è impostata.")
-    # Potremmo voler uscire qui in un caso reale: exit()
+    # exit()
+
+# --- Costanti e Dati di Validazione ---
+# Lista (semplificata) delle regioni italiane per la validazione
+# Nota: Andrebbe migliorata per gestire accenti, apostrofi, bilinguismo, etc.
+REGIONI_ITALIANE = [
+    "Abruzzo", "Basilicata", "Calabria", "Campania", "Emilia-Romagna",
+    "Friuli Venezia Giulia", "Lazio", "Liguria", "Lombardia", "Marche",
+    "Molise", "Piemonte", "Puglia", "Sardegna", "Sicilia", "Toscana",
+    "Trentino-Alto Adige", "Umbria", "Valle d'Aosta", "Veneto",
+    # Consideriamo anche le province autonome come 'regioni' per il file MIMIT
+    "Provincia Autonoma Bolzano", "Provincia Autonoma Trento"
+]
+# Converti in minuscolo per confronto case-insensitive più semplice
+REGIONI_ITALIANE_LOWER = [r.lower() for r in REGIONI_ITALIANE]
+
+TIPI_CARBURANTE_VALIDI = ["Benzina", "Diesel"]
+TIPI_CARBURANTE_VALIDI_LOWER = [c.lower() for c in TIPI_CARBURANTE_VALIDI]
+
+# URL del file CSV (lo useremo più avanti)
+CSV_URL = "https://www.mimit.gov.it/images/stories/carburanti/MediaRegionaleStradale.csv"
+
+# --- Funzioni Helper (per ora simulate) ---
+
+def get_prezzo_simulato(regione: str, carburante: str) -> tuple[float | None, str | None]:
+    """
+    Simula il recupero del prezzo.
+    In futuro, questa funzione leggerà dal DB SQLite.
+    Restituisce una tupla: (prezzo, data_aggiornamento_str) o (None, None) se non trovato.
+    """
+    logger.info(f"Simulazione recupero prezzo per {carburante} in {regione}")
+    # Logica simulata: restituisci un prezzo fisso se l'input è valido
+    # (la validazione vera è fatta prima di chiamare questa funzione)
+    if carburante.lower() == "benzina":
+        prezzo = 1.85
+    elif carburante.lower() == "diesel":
+        prezzo = 1.75
+    else:
+        prezzo = None # Non dovrebbe succedere se validato prima
+
+    if prezzo:
+        # Restituisce il prezzo simulato e la data di oggi come stringa
+        data_oggi = datetime.now().strftime("%d/%m/%Y")
+        return prezzo, data_oggi
+    else:
+        return None, None
 
 # --- Definizione dei Gestori di Comandi/Messaggi ---
 
@@ -31,61 +79,96 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<code>/prezzo NomeRegione TipoCarburante</code>\n\n"
         "Esempi:\n"
         "<code>/prezzo Lombardia Benzina</code>\n"
-        "<code>/prezzo Sicilia Diesel</code>\n\n"
-        # Rimuoviamo la nota "(Attualmente posso solo salutarti...)"
-        # perché ora /prezzo fa qualcosa (anche se non cerca ancora il prezzo)
+        "<code>/prezzo Sicilia Diesel</code>\n"
+        "<code>/prezzo Friuli Venezia Giulia Diesel</code>" # Esempio con spazi
     )
     await update.message.reply_html(welcome_message, disable_web_page_preview=True)
 
-# --- Definizione del Gestore per /prezzo ---
+
 async def prezzo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Gestisce il comando /prezzo NomeRegione TipoCarburante."""
-    # context.args è una lista delle stringhe inserite dopo il comando /prezzo
     args = context.args
+    logger.info(f"Comando /prezzo ricevuto con args: {args}")
 
-    logger.info(f"Comando /prezzo ricevuto con args: {args}") # Log per debugging
-
-    # Controlla se il numero di argomenti è corretto (devono essere almeno 2)
-    # Il nome della regione può contenere spazi, l'ultimo è il carburante.
     if len(args) < 2:
         await update.message.reply_text(
             "Formato comando errato. Usa: /prezzo NomeRegione TipoCarburante\n"
             "Esempio: <code>/prezzo Lombardia Benzina</code>",
-            parse_mode='HTML' # Usiamo HTML per poter usare <code>
+            parse_mode='HTML'
         )
-        return # Esce dalla funzione se il formato è sbagliato
+        return
 
-    # Ricostruisce il nome della regione (potrebbe contenere spazi)
-    # Prende tutti gli argomenti tranne l'ultimo come potenziale nome regione
     nome_regione_input = " ".join(args[:-1])
-    # Prende l'ultimo argomento come potenziale tipo carburante
     tipo_carburante_input = args[-1]
 
-    # Normalizza l'input per facilitare i controlli successivi
-    # .strip() toglie spazi bianchi iniziali/finali
-    # .title() mette Maiuscola Ogni Iniziale Di Parola (utile per regioni tipo "Valle D'Aosta")
+    # Normalizzazione
     nome_regione_normalizzato = nome_regione_input.strip().title()
-    # .capitalize() mette solo la prima lettera maiuscola, il resto minuscolo (es. "Benzina", "Diesel")
     tipo_carburante_normalizzato = tipo_carburante_input.strip().capitalize()
 
     logger.info(f"Parsing: Regione='{nome_regione_normalizzato}', Carburante='{tipo_carburante_normalizzato}'")
 
-    # --- VALIDAZIONE INPUT (Aggiungeremo dopo) ---
-    # Qui dovremmo controllare se la regione è valida e se il carburante è "Benzina" o "Diesel"
+    # --- VALIDAZIONE INPUT ---
+    regione_valida = False
+    # Confronto case-insensitive (ignora maiuscole/minuscole)
+    if nome_regione_normalizzato.lower() in REGIONI_ITALIANE_LOWER:
+         # Se troviamo corrispondenza, usiamo il nome corretto dalla nostra lista
+         # per consistenza (es. utente scrive "valle d'aosta", noi usiamo "Valle d'Aosta")
+         index = REGIONI_ITALIANE_LOWER.index(nome_regione_normalizzato.lower())
+         nome_regione_validato = REGIONI_ITALIANE[index]
+         regione_valida = True
+         logger.info(f"Regione '{nome_regione_normalizzato}' validata come '{nome_regione_validato}'.")
+    else:
+        # Tentativo extra per nomi comuni errati (esempio)
+        if nome_regione_normalizzato.lower() == "emilia romagna":
+             nome_regione_validato = "Emilia-Romagna"
+             regione_valida = True
+        elif nome_regione_normalizzato.lower() == "trentino alto adige":
+             nome_regione_validato = "Trentino-Alto Adige"
+             regione_valida = True
+        # Aggiungere altre mappature se necessario...
 
-    # --- RECUPERO DATI (Aggiungeremo dopo) ---
-    # Qui interrogheremo lo storage (il nostro futuro DB SQLite)
+    if not regione_valida:
+        logger.warning(f"Regione non valida: '{nome_regione_normalizzato}'")
+        await update.message.reply_text(
+             f"'{nome_regione_normalizzato}' non sembra essere una regione italiana valida. Controlla il nome e riprova."
+        )
+        return
 
-    # --- RISPOSTA TEMPORANEA ---
-    # Per ora, rispondiamo semplicemente confermando cosa abbiamo capito
+    carburante_valido = False
+    if tipo_carburante_normalizzato.lower() in TIPI_CARBURANTE_VALIDI_LOWER:
+        # Usa il nome corretto dalla nostra lista ("Benzina" o "Diesel")
+        index = TIPI_CARBURANTE_VALIDI_LOWER.index(tipo_carburante_normalizzato.lower())
+        tipo_carburante_validato = TIPI_CARBURANTE_VALIDI[index]
+        carburante_valido = True
+        logger.info(f"Carburante '{tipo_carburante_normalizzato}' validato come '{tipo_carburante_validato}'.")
 
-    await update.message.reply_text(
-        f"OK, hai chiesto il prezzo per:\n"
-        f"Regione: <b>{nome_regione_normalizzato}</b>\n" # Usa grassetto per chiarezza
-        f"Carburante: <b>{tipo_carburante_normalizzato}</b>\n\n"
-        f"<i>(Logica di ricerca prezzo e data non ancora implementata)</i>", # Usa corsivo
-        parse_mode='HTML' # Abilita l'uso di <b> e <i>
-    )
+    if not carburante_valido:
+        logger.warning(f"Tipo carburante non valido: '{tipo_carburante_normalizzato}'")
+        await update.message.reply_text(
+            f"Tipo carburante non valido: '{tipo_carburante_normalizzato}'. Usa 'Benzina' o 'Diesel'."
+        )
+        return
+
+    # --- RECUPERO DATI (Simulato) ---
+    logger.info(f"Recupero prezzo per {tipo_carburante_validato} in {nome_regione_validato}")
+    prezzo_medio, data_aggiornamento = get_prezzo_simulato(nome_regione_validato, tipo_carburante_validato)
+
+    # --- RISPOSTA ALL'UTENTE ---
+    if prezzo_medio is not None and data_aggiornamento is not None:
+        messaggio_risposta = (
+            f"Prezzo medio <b>{tipo_carburante_validato}</b>\n"
+            f"in <b>{nome_regione_validato}</b>\n"
+            f"il <b>{data_aggiornamento}</b>:\n\n"
+            f"<b>€ {prezzo_medio:.3f}</b>" # Formatta a 3 decimali come nel file MIMIT
+        )
+        logger.info(f"Invio risposta: {messaggio_risposta}")
+        await update.message.reply_html(messaggio_risposta)
+    else:
+        # Questo non dovrebbe accadere con la simulazione, ma serve per il futuro
+        logger.error(f"Errore nel recupero dati simulati per {tipo_carburante_validato} in {nome_regione_validato}")
+        await update.message.reply_text(
+            f"Spiacente, non sono riuscito a recuperare il dato per {tipo_carburante_validato} in {nome_regione_validato}."
+        )
 
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -105,26 +188,19 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     logger.info("Application creata.")
 
-    # Registra i gestori (handlers) nell'applicazione.
-    # L'ordine può essere importante se i filtri si sovrappongono
+    # Registra i gestori
     application.add_handler(CommandHandler("start", start))
     logger.info("Handler per /start registrato.")
-    application.add_handler(CommandHandler("prezzo", prezzo)) # Gestore per /prezzo
+    application.add_handler(CommandHandler("prezzo", prezzo))
     logger.info("Handler per /prezzo registrato.")
-
-    # Gestore per messaggi di testo che non sono comandi (deve venire DOPO i CommandHandler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown))
     logger.info("Handler per messaggi di testo generici registrato.")
-
-    # Gestore per comandi non riconosciuti (generico, cattura tutto ciò che inizia con /)
-    # Mettendolo per ultimo, cattura solo i comandi non gestiti sopra.
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
     logger.info("Handler per comandi sconosciuti registrato.")
 
-    # Avvia il bot in modalità polling
+    # Avvia il bot
     logger.info("Avvio del bot in modalità polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# Esegui main() se lo script è lanciato direttamente
 if __name__ == "__main__":
     main()
