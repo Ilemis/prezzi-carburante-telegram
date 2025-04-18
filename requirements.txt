@@ -1,0 +1,3 @@
+python-telegram-bot==21.0.1
+httpx # Spesso richiesto come dipendenza sottostante
+requests # Ci servirà per scaricare il CSV
