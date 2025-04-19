@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from datetime import datetime
@@ -375,7 +376,7 @@ async def regione_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         thinking_message = await update.message.reply_text("🔍 Sto cercando i dati...", disable_notification=True)
 
         # Esegui la funzione DB in modo sicuro per asyncio
-        messaggio_prezzi = await context.application.run_sync(
+        messaggio_prezzi = await asyncio.to_thread(
             get_prezzi_regione_dal_db, nome_regione_normalizzato
         )
 
