@@ -1,4 +1,4 @@
-import asyncio
+import asyncio # Assicurati che sia presente
 import logging
 import os
 from datetime import datetime
@@ -127,10 +127,11 @@ def get_db_connection():
         return None
 
 def update_database():
-    """Scarica il CSV, lo processa e aggiorna il database Supabase."""
+    """Scarica il CSV, lo processa, aggiorna il DB e pulisce i dati vecchi."""
     logger.info(f"Tentativo di aggiornamento database da URL: {CSV_URL}")
     conn = None
     cur = None
+    cur_delete = None # Inizializza il cursore per la delete
     success = False # Flag per indicare successo/fallimento
 
     try:
@@ -139,7 +140,6 @@ def update_database():
         logger.info("CSV scaricato con successo.")
 
         # Usiamo StringIO per trattare la stringa del CSV come un file
-        # Decodifichiamo esplicitamente in UTF-8 (spesso usato da MIMIT)
         try:
             csv_text = response.content.decode('utf-8')
         except UnicodeDecodeError:
@@ -158,29 +158,25 @@ def update_database():
         righe_processate = 0
         righe_inserite = 0
 
-        # Gestione Formato CSV fornito (data in riga 1, separatore ';')
+        # --- INSERIMENTO DATI NUOVI ---
         prima_riga = csv_data.readline().strip()
         try:
-            # Estrai la data (es: "Aggiornamento 19-04-2025")
-            # Gestisce anche possibili spazi extra
             parti = prima_riga.split()
             if len(parti) < 2: raise ValueError("Formato prima riga non riconosciuto")
-            data_str = parti[-1] # Prende l'ultima parte, che dovrebbe essere la data
+            data_str = parti[-1]
             data_aggiornamento = datetime.strptime(data_str, "%d-%m-%Y").date()
             logger.info(f"Data aggiornamento rilevata dal CSV: {data_aggiornamento}")
         except (IndexError, ValueError, TypeError) as e:
             logger.error(f"Impossibile estrarre la data dalla prima riga: '{prima_riga}'. Errore: {e}")
-            return False # Non possiamo procedere senza data
+            return False # Errore fatale per questo aggiornamento
 
-        # Ora leggi il resto come CSV con ';'
         csv_reader = csv.reader(csv_data, delimiter=';')
         try:
-             header = next(csv_reader) # Leggi (e ignora) l'intestazione
+             header = next(csv_reader)
              logger.info(f"Intestazione CSV letta: {header}")
         except StopIteration:
              logger.error("Errore: il file CSV sembra vuoto dopo la prima riga.")
              return False
-
 
         for row in csv_reader:
             righe_processate += 1
@@ -188,67 +184,81 @@ def update_database():
                 if len(row) < 4:
                     logger.warning(f"Riga {righe_processate+2} ignorata (troppo corta): {row}")
                     continue
-
                 regione = row[0].strip()
                 tipo_carburante = row[1].strip()
-                # Ignoriamo colonna EROGAZIONE (row[2])
                 prezzo_str = row[3].strip()
-
                 if not regione or not tipo_carburante or not prezzo_str:
                     logger.warning(f"Riga {righe_processate+2} ignorata (dati mancanti): {row}")
                     continue
-
-                # Pulisci prezzo e converti (gestisce sia '.' che ',' come decimale)
                 try:
                    prezzo = float(prezzo_str.replace(",", "."))
                 except ValueError:
                    logger.warning(f"Prezzo non valido '{prezzo_str}' per {regione}/{tipo_carburante} (Riga {righe_processate+2}). Ignorata: {row}")
                    continue
-
-                # Validazione extra: la regione letta è in quelle che ci aspettiamo?
                 if regione not in REGIONI_VALIDATE:
                      logger.warning(f"Regione '{regione}' letta dal CSV ma non presente nella lista REGIONI_VALIDATE (Riga {righe_processate+2}). Riga ignorata: {row}")
-                     continue # Ignoriamo questa riga
+                     continue
 
-                # Query di inserimento/aggiornamento
-                # Inserisce solo se la combinazione regione/tipo/data non esiste già
                 query = """
                     INSERT INTO prezzi_regionali (regione, tipo_carburante, prezzo_medio, data_aggiornamento)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (regione, tipo_carburante, data_aggiornamento) DO NOTHING;
                 """
                 cur.execute(query, (regione, tipo_carburante, prezzo, data_aggiornamento))
-
                 if cur.rowcount > 0:
                     righe_inserite += 1
 
             except Exception as e:
                 logger.error(f"Errore processando la riga {righe_processate+2}: {row}. Errore: {e}")
-                conn.rollback() # Annulla transazione parziale per questa riga problematica se necessario
-                # Decidi se continuare con le altre righe o fermare tutto
-                # continue # Per provare a processare le righe successive
+                conn.rollback() # Annulla transazione parziale
 
-        # Fine del ciclo: committa tutte le modifiche valide
+        # Commit degli inserimenti
         conn.commit()
-        logger.info(f"Aggiornamento database completato. Righe CSV lette (dopo intestazione): {righe_processate}, Righe nuove inserite: {righe_inserite}.")
-        success = True # Aggiornamento andato a buon fine
+        logger.info(f"Inserimento dati completato. Righe CSV lette (dopo intestazione): {righe_processate}, Righe nuove inserite: {righe_inserite}.")
+
+        # --- PULIZIA DATI VECCHI ---
+        try:
+            giorni_da_mantenere = 30 # Mantieni gli ultimi 30 giorni
+            logger.info(f"Avvio pulizia dati più vecchi di {giorni_da_mantenere} giorni...")
+            cur_delete = conn.cursor() # Usa un nuovo cursore per la delete
+            query_delete = """
+                DELETE FROM prezzi_regionali
+                WHERE data_aggiornamento < CURRENT_DATE - INTERVAL '%s days';
+            """
+            cur_delete.execute(query_delete, (giorni_da_mantenere,))
+            righe_cancellate = cur_delete.rowcount
+            conn.commit() # Commit della cancellazione
+            logger.info(f"Pulizia completata. Righe vecchie cancellate: {righe_cancellate}.")
+            cur_delete.close() # Chiudi il cursore della delete
+            cur_delete = None # Resetta la variabile per il blocco finally
+        except psycopg2.Error as e:
+             logger.error(f"Errore Database durante la pulizia dei dati vecchi: {e}")
+             if conn and not conn.closed: conn.rollback() # Annulla cancellazione in caso di errore
+        except Exception as e:
+             logger.error(f"Errore imprevisto durante la pulizia: {e}")
+             if conn and not conn.closed: conn.rollback()
+
+        success = True # L'aggiornamento è considerato riuscito anche se la pulizia fallisce
 
     except requests.exceptions.RequestException as e:
         logger.error(f"Errore durante il download del CSV: {e}")
     except psycopg2.Error as e:
-        logger.error(f"Errore Database durante l'aggiornamento: {e}")
-        if conn: conn.rollback() # Annulla transazione se fallisce
+        logger.error(f"Errore Database durante l'aggiornamento/inserimento: {e}")
+        if conn: conn.rollback() # Annulla transazione
     except UnicodeDecodeError as e:
         logger.error(f"Errore di decodifica del file CSV: {e}")
     except Exception as e:
         logger.error(f"Errore imprevisto durante l'aggiornamento del database: {e}")
         if conn and not conn.closed: conn.rollback()
     finally:
-        # Assicurati di chiudere cursore e connessione
-        if cur: cur.close()
+        # Assicurati di chiudere tutti i cursori e la connessione
+        if cur and not cur.closed:
+            cur.close()
+        if cur_delete and not cur_delete.closed: # Chiudi anche cur_delete se esiste
+            cur_delete.close()
         if conn and not conn.closed:
              conn.close()
-             logger.info("Connessione al database chiusa.")
+             logger.info("Connessione al database chiusa (dopo aggiornamento e pulizia).")
     return success
 
 
@@ -326,7 +336,7 @@ def get_prezzi_regione_dal_db(nome_regione: str) -> str:
     finally:
         if cur: cur.close()
         if conn and not conn.closed: conn.close()
-        # logger.debug(f"Connessione DB chiusa per richiesta {nome_regione}.") # Log meno verboso
+        # logger.debug(f"Connessione DB chiusa per richiesta {nome_regione}.")
 
 # --- Definizione dei Gestori di Comandi/Messaggi Telegram ---
 
@@ -359,11 +369,8 @@ async def regione_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     nome_regione_input = command_text[1:].strip()
 
     # Normalizzazione più robusta per matchare REGIONI_VALIDATE
-    # Mette Maiuscola Iniziale ad ogni parola, gestisce spazi multipli, apostrofi
     nome_regione_normalizzato = ' '.join(word.capitalize() for word in nome_regione_input.replace("'", "' ").split())
-    # Ricompatta apostrofi (es. "Valle D' Aosta" -> "Valle d'Aosta")
     nome_regione_normalizzato = nome_regione_normalizzato.replace("' ", "'")
-    # Casi specifici potrebbero non essere più necessari con questo approccio, ma li teniamo per sicurezza
     if "Valle D'aosta" in nome_regione_normalizzato: nome_regione_normalizzato = "Valle d'Aosta"
     if "Emilia Romagna" in nome_regione_normalizzato: nome_regione_normalizzato = "Emilia Romagna"
     if "Friuli Venezia Giulia" in nome_regione_normalizzato: nome_regione_normalizzato = "Friuli Venezia Giulia"
@@ -404,9 +411,6 @@ async def regione_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Risponde a comandi Telegram non gestiti esplicitamente."""
-    # Questo viene chiamato solo se nessun altro CommandHandler ha matchato
-    # il comando (es. /help se non definito, /qualcosa).
-    # Il gestore regione_command gestisce già i /NomeRegione non validi.
     await update.message.reply_text("Comando non riconosciuto. Digita /start per vedere i comandi disponibili.")
 
 async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -425,17 +429,10 @@ def main() -> None:
         return
     if not all([DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD]):
         logger.warning("Avvio con variabili DB mancanti. Le funzioni database non opereranno.")
-        # Decidi se uscire o continuare con funzionalità limitate
-        # return
 
     # --- Avvio Flask Server in un Thread Separato ---
-    # Render imposta PORT, altrimenti usa 8080 per test locali
     flask_port = int(os.environ.get('PORT', 8080))
     logger.info(f"Avvio del server Flask su host 0.0.0.0 porta {flask_port}...")
-    # Usiamo 'werkzeug' come logger per Flask, impostiamo livello INFO
-    # flask_log = logging.getLogger('werkzeug')
-    # flask_log.setLevel(logging.INFO)
-    # Disabilitiamo use_reloader per evitare che parta due volte in debug/produzione Render
     flask_thread = threading.Thread(
         target=lambda: flask_app.run(host='0.0.0.0', port=flask_port, debug=False, use_reloader=False),
         daemon=True # Il thread termina quando il main termina
@@ -455,12 +452,6 @@ def main() -> None:
     # Gestore per i comandi /Regione (cattura tutti i comandi)
     application.add_handler(MessageHandler(filters.COMMAND & filters.ChatType.PRIVATE, regione_command))
     logger.info("Handler principale per /Regione (filters.COMMAND) registrato.")
-
-    # Gestore per comandi sconosciuti (viene dopo quello per /Regione)
-    # Cattura solo i comandi non gestiti da regione_command (se regione_command li ignorasse)
-    # Ma dato che regione_command gestisce anche i comandi non validi, questo potrebbe non servire
-    # application.add_handler(MessageHandler(filters.COMMAND & filters.ChatType.PRIVATE, unknown_command))
-    # logger.info("Handler per comandi sconosciuti registrato.")
 
     # Gestore per messaggi di testo non-comando
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, unknown_message))
