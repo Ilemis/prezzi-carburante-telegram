@@ -4,3 +4,4 @@ requests
 Flask>=2.0
 psycopg2-binary
 apscheduler>=3.10.4
+pytz>=2024.1
