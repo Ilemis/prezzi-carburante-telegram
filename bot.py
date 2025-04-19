@@ -8,9 +8,11 @@ from io import StringIO
 import psycopg2
 import threading
 from flask import Flask, request, abort # Aggiunto request e abort per il trigger
-
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from apscheduler.schedulers.background import BackgroundScheduler # Aggiunto per schedulazione
+from apscheduler.triggers.cron import CronTrigger # Aggiunto per schedulazione
+import pytz # Aggiunto per gestione fuso orario
 
 # --- Configurazione Logging ---
 logging.basicConfig(
@@ -430,6 +432,14 @@ def main() -> None:
     if not all([DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD]):
         logger.warning("Avvio con variabili DB mancanti. Le funzioni database non opereranno.")
 
+    # --- Configurazione Scheduler ---
+    logger.info("Configurazione dello scheduler APScheduler per aggiornamento giornaliero...")
+    scheduler = BackgroundScheduler()
+    trigger = CronTrigger(hour=8, minute=45, timezone=pytz.timezone("Europe/Rome"))
+    scheduler.add_job(update_database, trigger)
+    scheduler.start()
+    logger.info("Scheduler avviato per eseguire update_database() ogni giorno alle 8:45 Europe/Rome.")
+
     # --- Avvio Flask Server in un Thread Separato ---
     flask_port = int(os.environ.get('PORT', 8080))
     logger.info(f"Avvio del server Flask su host 0.0.0.0 porta {flask_port}...")
@@ -457,7 +467,6 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, unknown_message))
     logger.info("Handler per messaggi di testo generici registrato.")
 
-
     # Avvia il polling del bot Telegram (blocca il thread principale)
     logger.info("Avvio del bot Telegram in modalità polling...")
     try:
@@ -466,6 +475,7 @@ def main() -> None:
         logger.critical(f"Errore critico durante l'esecuzione del bot: {e}", exc_info=True)
     finally:
         logger.info("Bot Telegram polling terminato.")
+        scheduler.shutdown() # Ferma lo scheduler quando il bot termina
 
 # Esegui main() se lo script è lanciato direttamente
 if __name__ == "__main__":
