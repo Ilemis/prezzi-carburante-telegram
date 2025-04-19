@@ -3,3 +3,4 @@ httpx
 requests
 Flask>=2.0
 psycopg2-binary
+apscheduler>=3.10.4
